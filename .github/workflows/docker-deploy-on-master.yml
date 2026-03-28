@@ -1,0 +1,176 @@
+name: Deploy Image
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: matrixmayhem/zeroclaw
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres
+  OCI_SOURCE: https://github.com/matrixmayhem/zeroclaw
+
+jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact_name: zeroclaw-x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            artifact_name: zeroclaw-aarch64-unknown-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact_name }}.tar.gz zeroclaw
+
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.tar.gz
+          retention-days: 1
+
+  docker:
+    name: Push Deploy Image
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Compute deploy metadata
+        id: meta
+        shell: bash
+        run: echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Docker context with pre-built binaries
+        run: |
+          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
+          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Debian deploy image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile.debian
+          push: true
+          build-args: |
+            OCI_SOURCE=${{ env.OCI_SOURCE }}
+            OCI_REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ env.OCI_SOURCE }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=zeroclaw
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge-debian
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.meta.outputs.short_sha }}-debian
+          platforms: linux/amd64,linux/arm64

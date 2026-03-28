@@ -33,6 +33,10 @@ ci: fmt-check lint test
 build:
     cargo build --release --locked
 
+# Build and push the Dockploy image from a laptop when Actions minutes are exhausted.
+push-deploy-image edge_tag='edge-debian' platforms='linux/amd64,linux/arm64' push='1':
+    EDGE_TAG='{{edge_tag}}' PLATFORMS='{{platforms}}' PUSH='{{push}}' bash scripts/release/push_deploy_image.sh
+
 # Build in debug mode
 build-debug:
     cargo build

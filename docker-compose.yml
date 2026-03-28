@@ -9,16 +9,14 @@
 
 services:
   zeroclaw:
-    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
-    # For ARM64 environments where the distroless image exits immediately,
-    # switch to the Debian compatibility image instead:
-    # image: ghcr.io/zeroclaw-labs/zeroclaw:debian
-    # Or build locally (distroless, no shell):
-    # build: .
-    # Or build the Debian variant (includes bash, git, curl):
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile.debian
+    # Dockploy should pull this prebuilt image from GHCR instead of building
+    # from source on the server.
+    image: ghcr.io/matrixmayhem/zeroclaw:edge-debian
+    # To pin a known-good image for rollback, use:
+    # image: ghcr.io/matrixmayhem/zeroclaw:sha-<commit-sha>-debian
+    # If the package stays private, configure Dockploy with GHCR credentials.
+    # To publish the same deploy image from a laptop instead of Actions, run:
+    # just push-deploy-image
     container_name: zeroclaw
     restart: unless-stopped
     

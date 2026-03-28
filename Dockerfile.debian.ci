@@ -7,6 +7,8 @@
 FROM debian:bookworm-slim
 
 ARG TARGETARCH
+ARG OCI_SOURCE="https://github.com/matrixmayhem/zeroclaw"
+ARG OCI_REVISION=""
 
 # Install essential tools for agent shell operations
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,6 +23,9 @@ COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
 
 # Runtime directory structure and default config
 COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}"
 
 ENV LANG=C.UTF-8
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
