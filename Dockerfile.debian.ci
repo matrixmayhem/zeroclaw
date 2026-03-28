@@ -1,10 +1,10 @@
 # Dockerfile.debian.ci — CI/release Debian image using pre-built binaries.
-# Mirrors Dockerfile.ci but uses debian:bookworm-slim with shell tools
+# Mirrors Dockerfile.ci but uses debian:trixie-slim with shell tools
 # so the agent can use shell-based tools (pwd, ls, git, curl, etc.).
-# Used by release workflows to skip ~60 min QEMU cross-compilation.
+# Use Trixie here because CI-built Linux binaries currently require glibc 2.39.
 
 # ── Runtime (Debian with shell) ────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG TARGETARCH
 ARG OCI_SOURCE="https://github.com/matrixmayhem/zeroclaw"
