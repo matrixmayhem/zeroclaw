@@ -4488,6 +4488,7 @@ mod tests {
                 native_tool_calling: false,
                 vision: true,
                 prompt_caching: false,
+                audio_input_inline: false,
             }
         }
 

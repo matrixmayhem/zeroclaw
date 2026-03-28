@@ -357,6 +357,7 @@ impl Provider for OpenRouterProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            audio_input_inline: false,
         }
     }
 
@@ -693,10 +694,12 @@ mod tests {
             ChatMessage {
                 role: "system".into(),
                 content: "be concise".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "hello".into(),
+                transient_audio: None,
             },
         ];
 
@@ -739,10 +742,12 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: "Previous answer".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Follow-up".into(),
+                transient_audio: None,
             },
         ];
 
@@ -823,6 +828,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
+            transient_audio: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -918,6 +924,7 @@ mod tests {
             role: "assistant".into(),
             content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
+            transient_audio: None,
         }];
 
         let converted = OpenRouterProvider::convert_messages(&messages);
@@ -946,6 +953,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "tool".into(),
             content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
+            transient_audio: None,
         }];
 
         let converted = OpenRouterProvider::convert_messages(&messages);
@@ -1066,6 +1074,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: history_json.to_string(),
+            transient_audio: None,
         }];
         let native = OpenRouterProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
@@ -1089,6 +1098,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: history_json.to_string(),
+            transient_audio: None,
         }];
         let native = OpenRouterProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);

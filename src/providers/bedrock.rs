@@ -969,6 +969,7 @@ impl Provider for BedrockProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            audio_input_inline: false,
         }
     }
 
@@ -1400,6 +1401,7 @@ mod tests {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+                transient_audio: None,
             });
         }
         assert!(BedrockProvider::should_cache_conversation(&messages));
@@ -1595,6 +1597,7 @@ mod tests {
             ChatMessage {
                 role: "tool".to_string(),
                 content: "not valid json".to_string(),
+                transient_audio: None,
             },
         ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
@@ -1617,6 +1620,7 @@ mod tests {
             ChatMessage {
                 role: "tool".to_string(),
                 content: "raw output with no json".to_string(),
+                transient_audio: None,
             },
         ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);

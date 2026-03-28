@@ -143,6 +143,7 @@ impl SessionBackend for SqliteSessionBackend {
             Ok(ChatMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
+                transient_audio: None,
             })
         }) {
             Ok(r) => r,

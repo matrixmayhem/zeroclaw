@@ -329,8 +329,8 @@ pub struct TelegramChannel {
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
-    transcription: Option<crate::config::TranscriptionConfig>,
-    voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    transcription: Option<crate::channels::transcription::TranscriptionRuntime>,
+    voice_transcriptions: Arc<Mutex<std::collections::HashMap<String, String>>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_config: Option<crate::config::TtsConfig>,
@@ -373,7 +373,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
-            voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            voice_transcriptions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             workspace_dir: None,
             ack_reactions: true,
             tts_config: None,
@@ -413,9 +413,12 @@ impl TelegramChannel {
     }
 
     /// Configure voice transcription.
-    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+    pub fn with_transcription(
+        mut self,
+        runtime: crate::channels::transcription::TranscriptionRuntime,
+    ) -> Self {
+        if runtime.config.enabled {
+            self.transcription = Some(runtime);
         }
         self
     }
@@ -1146,12 +1149,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         })
     }
 
-    /// Attempt to parse a Telegram update as a voice message and transcribe it.
+    /// Attempt to parse a Telegram update as a voice message.
     ///
     /// Returns `None` if the message is not a voice message, transcription is disabled,
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let config = self.transcription.as_ref()?;
+        let runtime = self.transcription.as_ref()?;
+        let config = &runtime.config;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
@@ -1220,45 +1224,50 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
-
-        if text.trim().is_empty() {
-            tracing::info!("Voice transcription returned empty text, skipping");
-            return None;
-        }
-
         // Enter voice-chat mode so outgoing replies get a TTS voice note
         if let Ok(mut vc) = self.voice_chats.lock() {
             vc.insert(reply_target.clone());
         }
 
-        // Cache transcription for reply-context lookups
-        {
-            let mut cache = self.voice_transcriptions.lock();
+        let transcript_cache_key = format!("{chat_id}:{message_id}");
+        let voice_transcriptions = Arc::clone(&self.voice_transcriptions);
+        let transcript_prefix = if let Some(quote) = self.extract_reply_context(message) {
+            format!("{quote}\n\n[Voice] ")
+        } else {
+            "[Voice] ".to_string()
+        };
+        let placeholder_content = transcript_prefix.replace("[Voice] ", "[Voice message]");
+        let mime_type = super::transcription::mime_type_for_audio_file_name(&file_name)
+            .unwrap_or("audio/ogg")
+            .to_string();
+        let transient_audio = crate::providers::traits::TransientAudioInput {
+            mime_type,
+            file_name: file_name.clone(),
+            bytes: std::sync::Arc::new(audio_data),
+            duration_secs: Some(duration),
+        };
+        let pending_voice_note = super::transcription::PendingVoiceNoteInput::new(
+            transient_audio,
+            runtime.clone(),
+            transcript_prefix,
+        )
+        .with_transcript_ready_callback(Arc::new(move |transcript| {
+            let mut cache = voice_transcriptions.lock();
             if cache.len() >= 100 {
                 cache.clear();
             }
-            cache.insert(format!("{chat_id}:{message_id}"), text.clone());
-        }
-
-        let content = if let Some(quote) = self.extract_reply_context(message) {
-            format!("{quote}\n\n[Voice] {text}")
-        } else {
-            format!("[Voice] {text}")
-        };
+            cache.insert(transcript_cache_key.clone(), transcript);
+        }));
+        super::transcription::register_pending_voice_note(
+            format!("telegram_{chat_id}_{message_id}"),
+            pending_voice_note,
+        );
 
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
-            content,
+            content: placeholder_content,
             channel: "telegram".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4283,16 +4292,20 @@ mod tests {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
 
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(crate::channels::transcription::TranscriptionRuntime::from_config(
+                tc,
+            ));
         assert!(ch.transcription.is_some());
     }
 
     #[test]
     fn with_transcription_skips_when_disabled() {
         let tc = crate::config::TranscriptionConfig::default(); // enabled = false
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(crate::channels::transcription::TranscriptionRuntime::from_config(
+                tc,
+            ));
         assert!(ch.transcription.is_none());
     }
 
@@ -4318,8 +4331,10 @@ mod tests {
         tc.enabled = true;
         tc.max_duration_secs = 5;
 
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(crate::channels::transcription::TranscriptionRuntime::from_config(
+                tc,
+            ));
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
@@ -4340,7 +4355,9 @@ mod tests {
         tc.max_duration_secs = 120;
 
         let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false)
-            .with_transcription(tc);
+            .with_transcription(crate::channels::transcription::TranscriptionRuntime::from_config(
+                tc,
+            ));
         let update = serde_json::json!({
             "message": {
                 "message_id": 3,

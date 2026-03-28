@@ -5,7 +5,7 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider, TokenUsage};
+use crate::providers::traits::{ChatMessage, Provider, TokenUsage, TransientAudioInput};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -153,6 +153,9 @@ struct InlineData {
     data: String,
 }
 
+pub(crate) const GEMINI_INLINE_DIRECT_AUDIO_MAX_BYTES: usize = 15 * 1024 * 1024;
+const GEMINI_DIRECT_AUDIO_CUE: &str = "User sent a voice note. Respond to its content directly.";
+
 /// Build Gemini Parts from a message content string.
 /// If the content contains [IMAGE:data:...] markers (already normalized by the
 /// multimodal pipeline), they are extracted as inline_data parts. The remaining
@@ -183,6 +186,34 @@ fn build_parts(content: &str) -> Vec<Part> {
         parts.push(Part::text(content));
     }
     parts
+}
+
+fn build_audio_inline_part(audio: &TransientAudioInput) -> anyhow::Result<Part> {
+    if audio.bytes.len() > GEMINI_INLINE_DIRECT_AUDIO_MAX_BYTES {
+        anyhow::bail!(
+            "Gemini inline audio payload exceeds fast-path threshold ({} bytes > {})",
+            audio.bytes.len(),
+            GEMINI_INLINE_DIRECT_AUDIO_MAX_BYTES
+        );
+    }
+
+    Ok(Part::Inline {
+        inline_data: InlineData {
+            mime_type: audio.mime_type.clone(),
+            data: base64::engine::general_purpose::STANDARD.encode(audio.bytes.as_ref()),
+        },
+    })
+}
+
+fn build_user_parts(message: &ChatMessage) -> anyhow::Result<Vec<Part>> {
+    if let Some(audio) = message.transient_audio.as_ref() {
+        return Ok(vec![
+            Part::text(GEMINI_DIRECT_AUDIO_CUE),
+            build_audio_inline_part(audio)?,
+        ]);
+    }
+
+    Ok(build_parts(&message.content))
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1195,6 +1226,7 @@ impl Provider for GeminiProvider {
             vision: true,
             native_tool_calling: false,
             prompt_caching: false,
+            audio_input_inline: true,
         }
     }
 
@@ -1238,7 +1270,7 @@ impl Provider for GeminiProvider {
                 "user" => {
                     contents.push(Content {
                         role: Some("user".to_string()),
-                        parts: build_parts(&msg.content),
+                        parts: build_user_parts(msg)?,
                     });
                 }
                 "assistant" => {
@@ -2270,5 +2302,54 @@ mod tests {
         // System messages should use Part::text
         let system_part = Part::text("You are helpful");
         assert!(matches!(system_part, Part::Text { .. }));
+    }
+
+    #[test]
+    fn build_user_parts_with_transient_audio_uses_cue_then_inline_audio_only() {
+        let message = ChatMessage::user("this transcript should not be sent").with_transient_audio(
+            TransientAudioInput {
+                mime_type: "audio/ogg".to_string(),
+                file_name: "voice.ogg".to_string(),
+                bytes: Arc::new(vec![1, 2, 3]),
+                duration_secs: Some(7),
+            },
+        );
+
+        let parts = build_user_parts(&message).expect("audio parts should build");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&parts[0]).unwrap(),
+            serde_json::json!({ "text": GEMINI_DIRECT_AUDIO_CUE })
+        );
+        assert_eq!(
+            serde_json::to_value(&parts[1]).unwrap(),
+            serde_json::json!({
+                "inline_data": {
+                    "mime_type": "audio/ogg",
+                    "data": "AQID"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn build_user_parts_without_transient_audio_preserves_existing_image_behavior() {
+        let message =
+            ChatMessage::user("Describe [IMAGE:data:image/png;base64,AAAA] in one sentence.");
+
+        let direct = build_user_parts(&message).expect("image parts should build");
+        let legacy = build_parts(&message.content);
+
+        assert_eq!(
+            serde_json::to_value(&direct).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn gemini_capabilities_report_inline_audio_support() {
+        let provider = test_provider(None);
+        assert!(provider.capabilities().audio_input_inline);
+        assert!(provider.supports_audio_input_inline());
     }
 }

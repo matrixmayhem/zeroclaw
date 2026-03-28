@@ -722,6 +722,7 @@ impl Provider for OpenAiCodexProvider {
             native_tool_calling: false,
             vision: true,
             prompt_caching: false,
+            audio_input_inline: false,
         }
     }
 
@@ -1021,18 +1022,22 @@ data: [DONE]
             ChatMessage {
                 role: "system".into(),
                 content: "You are helpful.".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Hi".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "Hello!".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Thanks".into(),
+                transient_audio: None,
             },
         ];
         let (instructions, input) = build_responses_input(&messages);
@@ -1056,6 +1061,7 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Hello".into(),
+            transient_audio: None,
         }];
         let (instructions, input) = build_responses_input(&messages);
         assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
@@ -1068,10 +1074,12 @@ data: [DONE]
             ChatMessage {
                 role: "tool".into(),
                 content: "result".into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Go".into(),
+                transient_audio: None,
             },
         ];
         let (instructions, input) = build_responses_input(&messages);

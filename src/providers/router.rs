@@ -164,6 +164,13 @@ impl Provider for RouterProvider {
             .any(|(_, provider)| provider.supports_vision())
     }
 
+    fn supports_audio_input_inline(&self) -> bool {
+        self.providers
+            .get(self.default_index)
+            .map(|(_, provider)| provider.supports_audio_input_inline())
+            .unwrap_or(false)
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
@@ -418,6 +425,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "use tools".to_string(),
+            transient_audio: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -449,6 +457,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "reason about this".to_string(),
+            transient_audio: None,
         }];
         let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
 

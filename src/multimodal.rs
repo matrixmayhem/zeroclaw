@@ -161,6 +161,7 @@ pub async fn prepare_messages_for_provider(
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
+            transient_audio: None,
         });
     }
 

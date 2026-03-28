@@ -91,6 +91,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::approval::ApprovalManager;
+use crate::auth::AuthService;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -208,6 +209,16 @@ const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
+const VOICE_NOTE_CANONICAL_PLACEHOLDER: &str = "[Voice note received]";
+const GEMINI_INLINE_TESTED_AUDIO_MIME_TYPES: &[&str] = &[
+    "audio/flac",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/ogg",
+    "audio/opus",
+    "audio/wav",
+    "audio/webm",
+];
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -223,6 +234,59 @@ fn channel_message_timeout_budget_secs(
     let iterations = max_tool_iterations.max(1) as u64;
     let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
     message_timeout_secs.saturating_mul(scale)
+}
+
+fn provider_name_indicates_gemini(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("gemini")
+}
+
+fn gemini_inline_audio_mime_supported(mime_type: &str) -> bool {
+    let normalized = transcription::normalize_audio_mime(mime_type);
+    GEMINI_INLINE_TESTED_AUDIO_MIME_TYPES.contains(&normalized.as_str())
+}
+
+fn voice_note_fast_path_skip_reason(
+    provider: &dyn Provider,
+    pending_voice_note: &transcription::PendingVoiceNoteInput,
+) -> Option<String> {
+    if !provider.supports_audio_input_inline() {
+        return Some("provider_missing_audio_input_inline".to_string());
+    }
+
+    if let Err(err) = transcription::validate_transcription_runtime(
+        &pending_voice_note.transcription_runtime,
+    ) {
+        return Some(format!("transcription_unavailable:{err}"));
+    }
+
+    if !pending_voice_note.transcription_runtime.config.enabled {
+        return Some("transcription_disabled".to_string());
+    }
+
+    if pending_voice_note
+        .audio
+        .duration_secs
+        .is_some_and(|duration| {
+            duration > pending_voice_note.transcription_runtime.config.max_duration_secs
+        })
+    {
+        return Some("duration_exceeds_transcription_limit".to_string());
+    }
+
+    if !transcription::transcription_supports_mime(&pending_voice_note.audio.mime_type) {
+        return Some("mime_not_supported_by_transcription".to_string());
+    }
+
+    if !gemini_inline_audio_mime_supported(&pending_voice_note.audio.mime_type) {
+        return Some("mime_not_supported_by_gemini_inline_audio".to_string());
+    }
+
+    if pending_voice_note.audio.bytes.len() > crate::providers::gemini::GEMINI_INLINE_DIRECT_AUDIO_MAX_BYTES
+    {
+        return Some("audio_bytes_exceed_gemini_inline_threshold".to_string());
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1168,6 +1232,149 @@ fn rollback_orphan_user_turn(
     true
 }
 
+fn build_channel_history_response(
+    channel_name: &str,
+    history: &[ChatMessage],
+    history_len_before_tools: usize,
+    delivered_response: &str,
+) -> String {
+    let tool_summary = extract_tool_context_summary(history, history_len_before_tools);
+    if tool_summary.is_empty() || channel_name == "telegram" {
+        delivered_response.to_string()
+    } else {
+        format!("{tool_summary}\n{delivered_response}")
+    }
+}
+
+fn maybe_schedule_memory_consolidation(
+    ctx: &ChannelRuntimeContext,
+    user_message: &str,
+    assistant_response: &str,
+) {
+    if ctx.auto_save_memory && user_message.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        let provider = Arc::clone(&ctx.provider);
+        let model = ctx.model.to_string();
+        let memory = Arc::clone(&ctx.memory);
+        let user_msg = user_message.to_string();
+        let assistant_resp = assistant_response.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = crate::memory::consolidation::consolidate_turn(
+                provider.as_ref(),
+                &model,
+                memory.as_ref(),
+                &user_msg,
+                &assistant_resp,
+            )
+            .await
+            {
+                tracing::debug!("Memory consolidation skipped: {e}");
+            }
+        });
+    }
+}
+
+async fn apply_outbound_message_hooks(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    outbound_response: String,
+) -> Option<String> {
+    let mut next_response = outbound_response;
+    if let Some(hooks) = &ctx.hooks {
+        match hooks
+            .run_on_message_sending(
+                msg.channel.clone(),
+                msg.reply_target.clone(),
+                next_response.clone(),
+            )
+            .await
+        {
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "outgoing message suppressed by hook");
+                return None;
+            }
+            crate::hooks::HookResult::Continue((
+                hook_channel,
+                hook_recipient,
+                mut modified_content,
+            )) => {
+                if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                    tracing::warn!(
+                        from_channel = %msg.channel,
+                        from_recipient = %msg.reply_target,
+                        to_channel = %hook_channel,
+                        to_recipient = %hook_recipient,
+                        "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                    );
+                }
+
+                let modified_len = modified_content.chars().count();
+                if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                    tracing::warn!(
+                        limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                        attempted = modified_len,
+                        "hook-modified outbound content exceeded limit; truncating"
+                    );
+                    modified_content =
+                        truncate_with_ellipsis(&modified_content, CHANNEL_HOOK_MAX_OUTBOUND_CHARS);
+                }
+
+                if modified_content != next_response {
+                    tracing::info!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        before_len = next_response.chars().count(),
+                        after_len = modified_content.chars().count(),
+                        "outgoing message content modified by hook"
+                    );
+                }
+
+                next_response = modified_content;
+            }
+        }
+    }
+
+    Some(next_response)
+}
+
+async fn deliver_channel_response(
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    thread_ts: Option<String>,
+    draft_message_id: Option<&str>,
+    delivered_response: &str,
+) -> bool {
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    if let Some(draft_id) = draft_message_id {
+        if let Err(e) = channel
+            .finalize_draft(reply_target, draft_id, delivered_response)
+            .await
+        {
+            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+            return channel
+                .send(&SendMessage::new(delivered_response, reply_target).in_thread(thread_ts))
+                .await
+                .map(|_| true)
+                .unwrap_or_else(|err| {
+                    eprintln!("Failed to reply on {}: {err}", channel.name());
+                    false
+                });
+        }
+        return true;
+    }
+
+    channel
+        .send(&SendMessage::new(delivered_response, reply_target).in_thread(thread_ts))
+        .await
+        .map(|_| true)
+        .unwrap_or_else(|err| {
+            eprintln!("Failed to reply on {}: {err}", channel.name());
+            false
+        })
+}
+
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
         return true;
@@ -2034,6 +2241,7 @@ async fn process_channel_message(
     } else {
         msg
     };
+    let pending_voice_note = transcription::take_pending_voice_note(&msg.id);
 
     let target_channel = ctx
         .channels_by_name
@@ -2106,7 +2314,60 @@ async fn process_channel_message(
             return;
         }
     };
+    let mut fast_path_voice_note = None;
+    if let Some(pending_voice_note) = pending_voice_note {
+        if let Some(skip_reason) =
+            voice_note_fast_path_skip_reason(active_provider.as_ref(), &pending_voice_note)
+        {
+            tracing::info!(
+                message_id = %msg.id,
+                channel = %msg.channel,
+                provider = %route.provider,
+                skip_reason = %skip_reason,
+                mime_type = %pending_voice_note.audio.mime_type,
+                bytes = pending_voice_note.audio.bytes.len(),
+                duration_secs = pending_voice_note.audio.duration_secs,
+                "Gemini direct-audio fast path skipped for voice note"
+            );
+
+            match pending_voice_note.transcribe_shadow().await {
+                Ok(transcript) if !transcript.trim().is_empty() => {
+                    pending_voice_note.notify_transcript_ready(&transcript);
+                    msg.content = pending_voice_note.format_stt_only_content(&transcript);
+                }
+                Ok(_) => {
+                    tracing::info!(
+                        message_id = %msg.id,
+                        channel = %msg.channel,
+                        "Voice-note transcription returned empty text; dropping message"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        message_id = %msg.id,
+                        channel = %msg.channel,
+                        skip_reason = %skip_reason,
+                        "Voice-note transcription failed after fast-path skip: {err}"
+                    );
+                    return;
+                }
+            }
+        } else {
+            tracing::info!(
+                message_id = %msg.id,
+                channel = %msg.channel,
+                provider = %route.provider,
+                mime_type = %pending_voice_note.audio.mime_type,
+                bytes = pending_voice_note.audio.bytes.len(),
+                duration_secs = pending_voice_note.audio.duration_secs,
+                "Gemini direct-audio fast path attempted for voice note"
+            );
+            fast_path_voice_note = Some(pending_voice_note);
+        }
+    }
     if ctx.auto_save_memory
+        && fast_path_voice_note.is_none()
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !memory::should_skip_autosave_content(&msg.content)
     {
@@ -2142,12 +2403,22 @@ async fn process_channel_message(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    let current_user_turn = fast_path_voice_note.as_ref().map(|pending_voice_note| {
+        ChatMessage::user(String::new()).with_transient_audio(pending_voice_note.audio.clone())
+    });
+
+    if fast_path_voice_note.is_none() {
+        // Preserve user turn before the LLM call so interrupted requests keep context.
+        append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = if force_fresh_session {
-        vec![ChatMessage::user(&msg.content)]
+        if let Some(current_user_turn) = current_user_turn.as_ref() {
+            vec![current_user_turn.clone()]
+        } else {
+            vec![ChatMessage::user(&msg.content)]
+        }
     } else {
         ctx.conversation_histories
             .lock()
@@ -2202,6 +2473,15 @@ async fn process_channel_message(
             "Proactively trimmed conversation history to fit context budget"
         );
     }
+    let retry_prior_turns = if fast_path_voice_note.is_some() {
+        if force_fresh_session {
+            Vec::new()
+        } else {
+            prior_turns.clone()
+        }
+    } else {
+        Vec::new()
+    };
 
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
@@ -2260,8 +2540,14 @@ async fn process_channel_message(
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
+    let system_prompt_for_retry = system_prompt.clone();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    if !force_fresh_session {
+        if let Some(current_user_turn) = current_user_turn {
+            history.push(current_user_turn);
+        }
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2274,7 +2560,7 @@ async fn process_channel_message(
         "Draft streaming decision"
     );
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    let (mut delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -2391,6 +2677,42 @@ async fn process_channel_message(
         Cancelled,
     }
 
+    let mut shadow_transcription_task = fast_path_voice_note.as_ref().map(|pending_voice_note| {
+        let pending_voice_note = pending_voice_note.clone();
+        tokio::spawn(async move {
+            let transcript = pending_voice_note.transcribe_shadow().await;
+            if let Ok(ref text) = transcript {
+                pending_voice_note.notify_transcript_ready(text);
+            }
+            transcript
+        })
+    });
+
+    let live_audio_provider = if fast_path_voice_note.is_some()
+        && provider_name_indicates_gemini(&route.provider)
+    {
+        match providers::create_provider_with_options(
+            &route.provider,
+            route.api_key.as_deref(),
+            &ctx.provider_runtime_options,
+        ) {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                tracing::warn!(
+                    provider = %route.provider,
+                    message_id = %msg.id,
+                    "Failed to build dedicated Gemini live-audio provider; using active provider: {err}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let llm_provider: &dyn Provider = live_audio_provider
+        .as_deref()
+        .map_or(active_provider.as_ref(), |provider| provider);
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_call_start = Instant::now();
@@ -2402,7 +2724,7 @@ async fn process_channel_message(
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
             run_tool_call_loop(
-                active_provider.as_ref(),
+                llm_provider,
                 &mut history,
                 ctx.tools_registry.as_ref(),
                 notify_observer.as_ref() as &dyn Observer,
@@ -2416,7 +2738,7 @@ async fn process_channel_message(
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
-                delta_tx,
+                delta_tx.clone(),
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli"
                     || ctx.autonomy_level == AutonomyLevel::Full
@@ -2432,6 +2754,7 @@ async fn process_channel_message(
         ) => LlmExecutionResult::Completed(result),
     };
 
+    drop(delta_tx.take());
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
@@ -2467,6 +2790,9 @@ async fn process_channel_message(
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
+            if let Some(task) = shadow_transcription_task.take() {
+                task.abort();
+            }
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
@@ -2495,62 +2821,14 @@ async fn process_channel_message(
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
             // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
-            if let Some(hooks) = &ctx.hooks {
-                match hooks
-                    .run_on_message_sending(
-                        msg.channel.clone(),
-                        msg.reply_target.clone(),
-                        outbound_response.clone(),
-                    )
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(%reason, "outgoing message suppressed by hook");
-                        return;
-                    }
-                    crate::hooks::HookResult::Continue((
-                        hook_channel,
-                        hook_recipient,
-                        mut modified_content,
-                    )) => {
-                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
-                            tracing::warn!(
-                                from_channel = %msg.channel,
-                                from_recipient = %msg.reply_target,
-                                to_channel = %hook_channel,
-                                to_recipient = %hook_recipient,
-                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
-                            );
-                        }
-
-                        let modified_len = modified_content.chars().count();
-                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
-                            tracing::warn!(
-                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                                attempted = modified_len,
-                                "hook-modified outbound content exceeded limit; truncating"
-                            );
-                            modified_content = truncate_with_ellipsis(
-                                &modified_content,
-                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                            );
-                        }
-
-                        if modified_content != outbound_response {
-                            tracing::info!(
-                                channel = %msg.channel,
-                                sender = %msg.sender,
-                                before_len = outbound_response.chars().count(),
-                                after_len = modified_content.chars().count(),
-                                "outgoing message content modified by hook"
-                            );
-                        }
-
-                        outbound_response = modified_content;
-                    }
+            let Some(outbound_response) =
+                apply_outbound_message_hooks(ctx.as_ref(), &msg, response).await
+            else {
+                if let Some(task) = shadow_transcription_task.take() {
+                    task.abort();
                 }
-            }
+                return;
+            };
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
@@ -2577,77 +2855,405 @@ async fn process_channel_message(
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
-
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
+            let history_response = build_channel_history_response(
+                &msg.channel,
+                &history,
+                history_len_before_tools,
+                &delivered_response,
             );
-
-            // Fire-and-forget LLM-driven memory consolidation.
-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let provider = Arc::clone(&ctx.provider);
-                let model = ctx.model.to_string();
-                let memory = Arc::clone(&ctx.memory);
-                let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
-                        &model,
-                        memory.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        tracing::debug!("Memory consolidation skipped: {e}");
-                    }
-                });
-            }
 
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
-                        .await
-                    {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+            let delivered = deliver_channel_response(
+                target_channel.as_ref(),
+                &msg.reply_target,
+                msg.thread_ts.clone(),
+                draft_message_id.as_deref(),
+                &delivered_response,
+            )
+            .await;
+
+            if !delivered {
+                if let Some(task) = shadow_transcription_task.take() {
+                    task.abort();
                 }
+            } else if fast_path_voice_note.is_some() {
+                tracing::info!(
+                    message_id = %msg.id,
+                    channel = %msg.channel,
+                    provider = %route.provider,
+                    "Gemini live-audio response succeeded"
+                );
+
+                let canonical_user_text = match shadow_transcription_task.take() {
+                    Some(mut task) => {
+                        tokio::select! {
+                            () = cancellation_token.cancelled() => {
+                                task.abort();
+                                tracing::info!(
+                                    message_id = %msg.id,
+                                    channel = %msg.channel,
+                                    "Cancelled while awaiting shadow transcription after live-audio success"
+                                );
+                                return;
+                            }
+                            result = &mut task => {
+                                match result {
+                                    Ok(Ok(transcript)) if !transcript.trim().is_empty() => {
+                                        tracing::info!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            "Shadow transcript succeeded after live-audio success"
+                                        );
+                                        transcript
+                                    }
+                                    Ok(Ok(_)) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            placeholder = VOICE_NOTE_CANONICAL_PLACEHOLDER,
+                                            "Shadow transcript was empty after live-audio success; persisting placeholder"
+                                        );
+                                        VOICE_NOTE_CANONICAL_PLACEHOLDER.to_string()
+                                    }
+                                    Ok(Err(err)) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            placeholder = VOICE_NOTE_CANONICAL_PLACEHOLDER,
+                                            "Shadow transcript failed after live-audio success; persisting placeholder: {err}"
+                                        );
+                                        VOICE_NOTE_CANONICAL_PLACEHOLDER.to_string()
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            placeholder = VOICE_NOTE_CANONICAL_PLACEHOLDER,
+                                            "Shadow transcription task failed after live-audio success; persisting placeholder: {err}"
+                                        );
+                                        VOICE_NOTE_CANONICAL_PLACEHOLDER.to_string()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => VOICE_NOTE_CANONICAL_PLACEHOLDER.to_string(),
+                };
+
+                if ctx.auto_save_memory
+                    && canonical_user_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                    && !memory::should_skip_autosave_content(&canonical_user_text)
+                {
+                    let autosave_key = conversation_memory_key(&msg);
+                    let _ = ctx
+                        .memory
+                        .store(
+                            &autosave_key,
+                            &canonical_user_text,
+                            crate::memory::MemoryCategory::Conversation,
+                            Some(&history_key),
+                        )
+                        .await;
+                }
+
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::user(&canonical_user_text),
+                );
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+                maybe_schedule_memory_consolidation(
+                    ctx.as_ref(),
+                    &canonical_user_text,
+                    &delivered_response,
+                );
+            } else {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+                maybe_schedule_memory_consolidation(
+                    ctx.as_ref(),
+                    &msg.content,
+                    &delivered_response,
+                );
             }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
+            if fast_path_voice_note.is_some()
+                && !crate::agent::loop_::is_tool_loop_cancelled(&e)
+                && !cancellation_token.is_cancelled()
+            {
+                tracing::warn!(
+                    message_id = %msg.id,
+                    channel = %msg.channel,
+                    provider = %route.provider,
+                    "Gemini live-audio response failed; waiting for shadow transcript before fallback retry: {e}"
+                );
+
+                let transcript = match shadow_transcription_task.take() {
+                    Some(mut task) => {
+                        tokio::select! {
+                            () = cancellation_token.cancelled() => {
+                                task.abort();
+                                if let (Some(channel), Some(draft_id)) =
+                                    (target_channel.as_ref(), draft_message_id.as_deref())
+                                {
+                                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                                }
+                                return;
+                            }
+                            result = &mut task => {
+                                match result {
+                                    Ok(Ok(transcript)) if !transcript.trim().is_empty() => {
+                                        tracing::info!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            "Shadow transcript succeeded after live-audio failure"
+                                        );
+                                        transcript
+                                    }
+                                    Ok(Ok(_)) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            "Shadow transcript was empty after live-audio failure"
+                                        );
+                                        let error_text = format!("Warning: {e}");
+                                        if let Some(channel) = target_channel.as_ref() {
+                                            if let Some(ref draft_id) = draft_message_id {
+                                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, &error_text).await;
+                                            } else {
+                                                let _ = channel.send(&SendMessage::new(&error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    Ok(Err(transcript_err)) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            "Shadow transcript failed after live-audio failure: {transcript_err}"
+                                        );
+                                        let error_text = format!("Warning: {e}");
+                                        if let Some(channel) = target_channel.as_ref() {
+                                            if let Some(ref draft_id) = draft_message_id {
+                                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, &error_text).await;
+                                            } else {
+                                                let _ = channel.send(&SendMessage::new(&error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    Err(join_err) => {
+                                        tracing::warn!(
+                                            message_id = %msg.id,
+                                            channel = %msg.channel,
+                                            "Shadow transcription task failed after live-audio failure: {join_err}"
+                                        );
+                                        let error_text = format!("Warning: {e}");
+                                        if let Some(channel) = target_channel.as_ref() {
+                                            if let Some(ref draft_id) = draft_message_id {
+                                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, &error_text).await;
+                                            } else {
+                                                let _ = channel.send(&SendMessage::new(&error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let error_text = format!("Warning: {e}");
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Some(ref draft_id) = draft_message_id {
+                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, &error_text).await;
+                            } else {
+                                let _ = channel.send(&SendMessage::new(&error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                tracing::info!(
+                    message_id = %msg.id,
+                    channel = %msg.channel,
+                    provider = %route.provider,
+                    "Fallback retry attempted with transcript text after live-audio failure"
+                );
+
+                let mut retry_history = vec![ChatMessage::system(system_prompt_for_retry.clone())];
+                retry_history.extend(retry_prior_turns.clone());
+                retry_history.push(ChatMessage::user(&transcript));
+                let retry_history_len_before_tools = retry_history.len();
+                let retry_result = tokio::select! {
+                    () = cancellation_token.cancelled() => None,
+                    result = tokio::time::timeout(
+                        Duration::from_secs(timeout_budget_secs),
+                        run_tool_call_loop(
+                            active_provider.as_ref(),
+                            &mut retry_history,
+                            ctx.tools_registry.as_ref(),
+                            ctx.observer.as_ref() as &dyn Observer,
+                            route.provider.as_str(),
+                            route.model.as_str(),
+                            runtime_defaults.temperature,
+                            true,
+                            Some(&*ctx.approval_manager),
+                            msg.channel.as_str(),
+                            Some(msg.reply_target.as_str()),
+                            &ctx.multimodal,
+                            ctx.max_tool_iterations,
+                            Some(cancellation_token.clone()),
+                            None,
+                            ctx.hooks.as_deref(),
+                            if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+                                &[]
+                            } else {
+                                ctx.non_cli_excluded_tools.as_ref()
+                            },
+                            ctx.tool_call_dedup_exempt.as_ref(),
+                            ctx.activated_tools.as_ref(),
+                            None,
+                        ),
+                    ) => Some(result),
+                };
+
+                match retry_result {
+                    None => return,
+                    Some(Ok(Ok(retry_response))) => {
+                        tracing::info!(
+                            message_id = %msg.id,
+                            channel = %msg.channel,
+                            provider = %route.provider,
+                            "Fallback retry succeeded after live-audio failure"
+                        );
+
+                        let Some(outbound_response) =
+                            apply_outbound_message_hooks(ctx.as_ref(), &msg, retry_response).await
+                        else {
+                            return;
+                        };
+
+                        let sanitized_response = sanitize_channel_response(
+                            &outbound_response,
+                            ctx.tools_registry.as_ref(),
+                        );
+                        let delivered_response = if sanitized_response.is_empty()
+                            && !outbound_response.trim().is_empty()
+                        {
+                            "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                        } else {
+                            sanitized_response
+                        };
+
+                        let history_response = build_channel_history_response(
+                            &msg.channel,
+                            &retry_history,
+                            retry_history_len_before_tools,
+                            &delivered_response,
+                        );
+
+                        let delivered = deliver_channel_response(
+                            target_channel.as_ref(),
+                            &msg.reply_target,
+                            msg.thread_ts.clone(),
+                            draft_message_id.as_deref(),
+                            &delivered_response,
+                        )
+                        .await;
+
+                        if delivered {
+                            if ctx.auto_save_memory
+                                && transcript.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                                && !memory::should_skip_autosave_content(&transcript)
+                            {
+                                let autosave_key = conversation_memory_key(&msg);
+                                let _ = ctx
+                                    .memory
+                                    .store(
+                                        &autosave_key,
+                                        &transcript,
+                                        crate::memory::MemoryCategory::Conversation,
+                                        Some(&history_key),
+                                    )
+                                    .await;
+                            }
+
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::user(&transcript),
+                            );
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::assistant(&history_response),
+                            );
+                            maybe_schedule_memory_consolidation(
+                                ctx.as_ref(),
+                                &transcript,
+                                &delivered_response,
+                            );
+                        }
+
+                        return;
+                    }
+                    Some(Ok(Err(retry_err))) => {
+                        tracing::warn!(
+                            message_id = %msg.id,
+                            channel = %msg.channel,
+                            provider = %route.provider,
+                            "Fallback retry failed after live-audio failure: {retry_err}"
+                        );
+                        let error_text = format!("Warning: {retry_err}");
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Some(ref draft_id) = draft_message_id {
+                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, &error_text).await;
+                            } else {
+                                let _ = channel.send(&SendMessage::new(&error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                            }
+                        }
+                        return;
+                    }
+                    Some(Err(_)) => {
+                        tracing::warn!(
+                            message_id = %msg.id,
+                            channel = %msg.channel,
+                            provider = %route.provider,
+                            "Fallback retry timed out after live-audio failure"
+                        );
+                        let error_text =
+                            "Request timed out while waiting for the model. Please try again.";
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Some(ref draft_id) = draft_message_id {
+                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                            } else {
+                                let _ = channel.send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
             {
+                if let Some(task) = shadow_transcription_task.take() {
+                    task.abort();
+                }
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
@@ -2764,10 +3370,186 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Err(_)) => {
+            if fast_path_voice_note.is_some() {
+                tracing::warn!(
+                    message_id = %msg.id,
+                    channel = %msg.channel,
+                    provider = %route.provider,
+                    "Gemini live-audio response timed out; waiting for shadow transcript before fallback retry"
+                );
+
+                let transcript = match shadow_transcription_task.take() {
+                    Some(mut task) => {
+                        tokio::select! {
+                            () = cancellation_token.cancelled() => {
+                                task.abort();
+                                return;
+                            }
+                            result = &mut task => {
+                                match result {
+                                    Ok(Ok(transcript)) if !transcript.trim().is_empty() => transcript,
+                                    _ => {
+                                        let error_text =
+                                            "Request timed out while waiting for the model. Please try again.";
+                                        if let Some(channel) = target_channel.as_ref() {
+                                            if let Some(ref draft_id) = draft_message_id {
+                                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                                            } else {
+                                                let _ = channel.send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let error_text =
+                            "Request timed out while waiting for the model. Please try again.";
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Some(ref draft_id) = draft_message_id {
+                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                            } else {
+                                let _ = channel.send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                let mut retry_history = vec![ChatMessage::system(system_prompt_for_retry.clone())];
+                retry_history.extend(retry_prior_turns.clone());
+                retry_history.push(ChatMessage::user(&transcript));
+                let retry_history_len_before_tools = retry_history.len();
+                let retry_result = tokio::select! {
+                    () = cancellation_token.cancelled() => None,
+                    result = tokio::time::timeout(
+                        Duration::from_secs(timeout_budget_secs),
+                        run_tool_call_loop(
+                            active_provider.as_ref(),
+                            &mut retry_history,
+                            ctx.tools_registry.as_ref(),
+                            ctx.observer.as_ref() as &dyn Observer,
+                            route.provider.as_str(),
+                            route.model.as_str(),
+                            runtime_defaults.temperature,
+                            true,
+                            Some(&*ctx.approval_manager),
+                            msg.channel.as_str(),
+                            Some(msg.reply_target.as_str()),
+                            &ctx.multimodal,
+                            ctx.max_tool_iterations,
+                            Some(cancellation_token.clone()),
+                            None,
+                            ctx.hooks.as_deref(),
+                            if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+                                &[]
+                            } else {
+                                ctx.non_cli_excluded_tools.as_ref()
+                            },
+                            ctx.tool_call_dedup_exempt.as_ref(),
+                            ctx.activated_tools.as_ref(),
+                            None,
+                        ),
+                    ) => Some(result),
+                };
+
+                match retry_result {
+                    None => return,
+                    Some(Ok(Ok(retry_response))) => {
+                        tracing::info!(
+                            message_id = %msg.id,
+                            channel = %msg.channel,
+                            provider = %route.provider,
+                            "Fallback retry succeeded after live-audio timeout"
+                        );
+                        let Some(outbound_response) =
+                            apply_outbound_message_hooks(ctx.as_ref(), &msg, retry_response).await
+                        else {
+                            return;
+                        };
+                        let sanitized_response = sanitize_channel_response(
+                            &outbound_response,
+                            ctx.tools_registry.as_ref(),
+                        );
+                        let delivered_response = if sanitized_response.is_empty()
+                            && !outbound_response.trim().is_empty()
+                        {
+                            "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                        } else {
+                            sanitized_response
+                        };
+                        let history_response = build_channel_history_response(
+                            &msg.channel,
+                            &retry_history,
+                            retry_history_len_before_tools,
+                            &delivered_response,
+                        );
+                        let delivered = deliver_channel_response(
+                            target_channel.as_ref(),
+                            &msg.reply_target,
+                            msg.thread_ts.clone(),
+                            draft_message_id.as_deref(),
+                            &delivered_response,
+                        )
+                        .await;
+                        if delivered {
+                            if ctx.auto_save_memory
+                                && transcript.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                                && !memory::should_skip_autosave_content(&transcript)
+                            {
+                                let autosave_key = conversation_memory_key(&msg);
+                                let _ = ctx
+                                    .memory
+                                    .store(
+                                        &autosave_key,
+                                        &transcript,
+                                        crate::memory::MemoryCategory::Conversation,
+                                        Some(&history_key),
+                                    )
+                                    .await;
+                            }
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::user(&transcript),
+                            );
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::assistant(&history_response),
+                            );
+                            maybe_schedule_memory_consolidation(
+                                ctx.as_ref(),
+                                &transcript,
+                                &delivered_response,
+                            );
+                        }
+                        return;
+                    }
+                    _ => {
+                        let error_text =
+                            "Request timed out while waiting for the model. Please try again.";
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Some(ref draft_id) = draft_message_id {
+                                let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                            } else {
+                                let _ = channel.send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone())).await;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
+            if let Some(task) = shadow_transcription_task.take() {
+                task.abort();
+            }
             runtime_trace::record_event(
                 "channel_message_timeout",
                 Some(msg.channel.as_str()),
@@ -3521,6 +4303,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
 
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Channel>> {
+    let transcription_auth_service = Arc::new(AuthService::from_config(config));
     match channel_id {
         "telegram" => {
             let tg = config
@@ -3539,7 +4322,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 )
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
+                .with_transcription(transcription::TranscriptionRuntime {
+                    config: config.transcription.clone(),
+                    auth_service: Some(Arc::clone(&transcription_auth_service)),
+                })
                 .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
@@ -3618,11 +4404,22 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+fn transcription_runtime_with_auth(
+    config: &Config,
+    auth_service: &Arc<AuthService>,
+) -> transcription::TranscriptionRuntime {
+    transcription::TranscriptionRuntime {
+        config: config.transcription.clone(),
+        auth_service: Some(Arc::clone(auth_service)),
+    }
+}
+
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
+    let transcription_auth_service = Arc::new(AuthService::from_config(config));
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -3639,7 +4436,10 @@ fn collect_configured_channels(
                 )
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
+                .with_transcription(transcription_runtime_with_auth(
+                    config,
+                    &transcription_auth_service,
+                ))
                 .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
@@ -3773,7 +4573,10 @@ fn collect_configured_channels(
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
                             )
-                            .with_transcription(config.transcription.clone())
+                            .with_transcription(transcription_runtime_with_auth(
+                                config,
+                                &transcription_auth_service,
+                            ))
                             .with_tts(config.tts.clone()),
                         ),
                     });

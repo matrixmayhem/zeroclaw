@@ -11,7 +11,7 @@ pub use schema::{
     ClassificationRule, CloudOpsConfig, ComposioConfig, Config, ConversationalAiConfig, CostConfig,
     CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig,
     DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig,
-    EstopConfig, FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig,
+    EstopConfig, FeishuConfig, GatewayConfig, GeminiSttConfig, GoogleSttConfig, GoogleTtsConfig,
     GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig, HardwareTransport,
     HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
     ImageProviderDalleConfig, ImageProviderFluxConfig, ImageProviderImagenConfig,

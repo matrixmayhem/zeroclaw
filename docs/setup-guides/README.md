@@ -32,3 +32,5 @@ For first-time setup and quick orientation.
 - Runtime operations: [../ops/README.md](../ops/README.md)
 - Reference catalogs: [../reference/README.md](../reference/README.md)
 - macOS lifecycle tasks: [macos-update-uninstall.md](macos-update-uninstall.md)
+- Gemini voice-note fast path: [gemini-direct-audio-fast-path.md](gemini-direct-audio-fast-path.md)
+- Gemini transcription auth and setup: [gemini-transcription-setup.md](gemini-transcription-setup.md)

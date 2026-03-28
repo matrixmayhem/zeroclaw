@@ -79,6 +79,8 @@ Last refreshed: **February 18, 2026**.
 - [setup-guides/README.md](setup-guides/README.md)
 - [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)
 - [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)
+- [gemini-direct-audio-fast-path.md](setup-guides/gemini-direct-audio-fast-path.md)
+- [gemini-transcription-setup.md](setup-guides/gemini-transcription-setup.md)
 
 ### 2) Command/Config References & Integrations
 

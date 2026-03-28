@@ -633,6 +633,7 @@ impl Provider for OllamaProvider {
             native_tool_calling: false,
             vision: true,
             prompt_caching: false,
+            audio_input_inline: false,
         }
     }
 
@@ -1154,6 +1155,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
+            transient_audio: None,
         }];
 
         let converted = provider.convert_messages(&messages);
@@ -1178,10 +1180,12 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: r#"{"content":null,"tool_calls":[{"id":"call_7","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#.into(),
+                transient_audio: None,
             },
             ChatMessage {
                 role: "tool".into(),
                 content: r#"{"tool_call_id":"call_7","content":"ok"}"#.into(),
+                transient_audio: None,
             },
         ];
 
@@ -1200,6 +1204,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
+            transient_audio: None,
         }];
 
         let converted = provider.convert_messages(&messages);

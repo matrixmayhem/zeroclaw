@@ -1244,6 +1244,7 @@ impl Provider for OpenAiCompatibleProvider {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
             prompt_caching: false,
+            audio_input_inline: false,
         }
     }
 
@@ -2871,6 +2872,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
+            transient_audio: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",

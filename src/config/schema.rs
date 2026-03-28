@@ -42,6 +42,11 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google",
+    "transcription.gemini",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -313,7 +318,7 @@ pub struct Config {
     #[serde(default)]
     pub hardware: HardwareConfig,
 
-    /// Voice transcription configuration (Whisper API via Groq).
+    /// Speech-to-text configuration with multiple provider backends.
     #[serde(default)]
     pub transcription: TranscriptionConfig,
 
@@ -738,6 +743,10 @@ fn default_google_stt_language_code() -> String {
     "en-US".into()
 }
 
+fn default_gemini_stt_model() -> String {
+    "gemini-3-flash-preview".into()
+}
+
 /// Voice transcription configuration with multi-provider support.
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
@@ -747,26 +756,26 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google", or
+    /// "gemini".
     #[serde(default = "default_transcription_provider")]
     pub default_provider: String,
-    /// API key used for transcription requests (Groq provider).
+    /// API key used for transcription requests (legacy Groq provider fields).
     ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Whisper API endpoint URL (Groq provider).
+    /// Whisper-compatible API endpoint URL (legacy Groq provider fields).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name (Groq provider).
+    /// Whisper model name (legacy Groq provider fields).
     #[serde(default = "default_transcription_model")]
     pub model: String,
-    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq provider.
+    /// Optional language hint for STT providers that accept one.
     #[serde(default)]
     pub language: Option<String>,
     /// Optional initial prompt to bias transcription toward expected vocabulary
-    /// (proper nouns, technical terms, etc.). Sent as the `prompt` field in the
-    /// Whisper API request.
+    /// (proper nouns, technical terms, etc.) when the selected provider supports it.
     #[serde(default)]
     pub initial_prompt: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
@@ -784,6 +793,9 @@ pub struct TranscriptionConfig {
     /// Google Cloud Speech-to-Text provider configuration.
     #[serde(default)]
     pub google: Option<GoogleSttConfig>,
+    /// Gemini STT provider configuration.
+    #[serde(default)]
+    pub gemini: Option<GeminiSttConfig>,
 }
 
 impl Default for TranscriptionConfig {
@@ -801,6 +813,7 @@ impl Default for TranscriptionConfig {
             deepgram: None,
             assemblyai: None,
             google: None,
+            gemini: None,
         }
     }
 }
@@ -1167,6 +1180,18 @@ pub struct GoogleSttConfig {
     /// BCP-47 language code (default: "en-US").
     #[serde(default = "default_google_stt_language_code")]
     pub language_code: String,
+}
+
+/// Gemini STT provider configuration (`[transcription.gemini]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GeminiSttConfig {
+    /// Gemini API key. If omitted, runtime can fall back to environment variables
+    /// or existing Gemini OAuth state.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Gemini model name used for audio transcription.
+    #[serde(default = "default_gemini_stt_model")]
+    pub model: String,
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -7116,6 +7141,13 @@ impl Config {
                     "config.transcription.google.api_key",
                 )?;
             }
+            if let Some(ref mut gemini) = config.transcription.gemini {
+                decrypt_optional_secret(
+                    &store,
+                    &mut gemini.api_key,
+                    "config.transcription.gemini.api_key",
+                )?;
+            }
 
             #[cfg(feature = "channel-nostr")]
             if let Some(ref mut ns) = config.channels_config.nostr {
@@ -8016,10 +8048,10 @@ impl Config {
         {
             let dp = self.transcription.default_provider.trim();
             match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" => {}
+                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "gemini" => {}
                 other => {
                     anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google (got '{other}')"
+                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, gemini (got '{other}')"
                     );
                 }
             }
@@ -8522,6 +8554,13 @@ impl Config {
                 "config.transcription.google.api_key",
             )?;
         }
+        if let Some(ref mut gemini) = config_to_save.transcription.gemini {
+            encrypt_optional_secret(
+                &store,
+                &mut gemini.api_key,
+                "config.transcription.gemini.api_key",
+            )?;
+        }
 
         #[cfg(feature = "channel-nostr")]
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
@@ -8882,7 +8921,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
-    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -12292,6 +12330,7 @@ default_model = "persisted-profile"
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
         assert_eq!(tc.max_duration_secs, 120);
+        assert!(tc.gemini.is_none());
     }
 
     #[test]
@@ -12299,6 +12338,10 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         config.transcription.enabled = true;
         config.transcription.language = Some("en".into());
+        config.transcription.gemini = Some(GeminiSttConfig {
+            api_key: Some("gemini-secret".into()),
+            model: "gemini-3.1-pro-preview".into(),
+        });
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
@@ -12306,6 +12349,23 @@ default_model = "persisted-profile"
         assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+        assert_eq!(
+            parsed.transcription.gemini.as_ref().map(|cfg| cfg.model.as_str()),
+            Some("gemini-3.1-pro-preview")
+        );
+    }
+
+    #[test]
+    async fn transcription_default_provider_accepts_gemini() {
+        let mut config = Config::default();
+        config.transcription.default_provider = "gemini".into();
+        config.transcription.enabled = true;
+        config.transcription.gemini = Some(GeminiSttConfig {
+            api_key: None,
+            model: default_gemini_stt_model(),
+        });
+
+        config.validate().unwrap();
     }
 
     #[test]
@@ -12823,6 +12883,64 @@ require_otp_to_resume = true
             loaded.security.nevis.client_secret.as_deref().unwrap(),
             plaintext_secret,
             "Loaded client_secret must match the original plaintext after decryption"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn transcription_gemini_api_key_encrypt_decrypt_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_transcription_gemini_secret_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext_secret = "gemini-test-api-key-value";
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.transcription.gemini = Some(GeminiSttConfig {
+            api_key: Some(plaintext_secret.into()),
+            model: default_gemini_stt_model(),
+        });
+
+        config.save().await.unwrap();
+
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(!raw_toml.contains(plaintext_secret));
+
+        let stored: Config = toml::from_str(&raw_toml).unwrap();
+        let stored_secret = stored
+            .transcription
+            .gemini
+            .as_ref()
+            .and_then(|cfg| cfg.api_key.as_ref())
+            .unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(stored_secret));
+
+        let store = crate::security::SecretStore::new(&dir, true);
+        assert_eq!(store.decrypt(stored_secret).unwrap(), plaintext_secret);
+
+        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
+        loaded.config_path = dir.join("config.toml");
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        decrypt_optional_secret(
+            &load_store,
+            &mut loaded.transcription.gemini.as_mut().unwrap().api_key,
+            "config.transcription.gemini.api_key",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded
+                .transcription
+                .gemini
+                .as_ref()
+                .and_then(|cfg| cfg.api_key.as_deref()),
+            Some(plaintext_secret)
         );
 
         let _ = fs::remove_dir_all(&dir).await;

@@ -65,7 +65,7 @@ pub struct WhatsAppWebChannel {
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
-    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription: Option<crate::channels::transcription::TranscriptionRuntime>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
@@ -110,9 +110,12 @@ impl WhatsAppWebChannel {
 
     /// Configure voice transcription (STT) for incoming voice notes.
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+    pub fn with_transcription(
+        mut self,
+        runtime: crate::channels::transcription::TranscriptionRuntime,
+    ) -> Self {
+        if runtime.config.enabled {
+            self.transcription = Some(runtime);
         }
         self
     }
@@ -309,17 +312,17 @@ impl WhatsAppWebChannel {
         ]
     }
 
-    /// Attempt to download and transcribe a WhatsApp voice note.
+    /// Attempt to download a WhatsApp voice note for deferred processing.
     ///
-    /// Returns `None` if transcription is disabled, download fails, or
-    /// transcription fails (all logged as warnings).
+    /// Returns `None` if transcription is disabled or download fails.
     #[cfg(feature = "whatsapp-web")]
-    async fn try_transcribe_voice_note(
+    async fn try_prepare_voice_note(
         client: &wa_rs::Client,
         audio: &wa_rs_proto::whatsapp::message::AudioMessage,
-        transcription_config: Option<&crate::config::TranscriptionConfig>,
-    ) -> Option<String> {
-        let config = transcription_config?;
+        transcription_runtime: Option<&crate::channels::transcription::TranscriptionRuntime>,
+    ) -> Option<crate::channels::transcription::PendingVoiceNoteInput> {
+        let runtime = transcription_runtime?;
+        let config = &runtime.config;
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds {
@@ -353,28 +356,27 @@ impl WhatsAppWebChannel {
         };
 
         tracing::info!(
-            "WhatsApp Web: transcribing voice note ({} bytes, file={})",
+            "WhatsApp Web: downloaded voice note for deferred processing ({} bytes, file={})",
             audio_data.len(),
             file_name
         );
 
-        match super::transcription::transcribe_audio(audio_data, file_name, config).await {
-            Ok(text) if text.trim().is_empty() => {
-                tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
-                None
-            }
-            Ok(text) => {
-                tracing::info!(
-                    "WhatsApp Web: voice note transcribed ({} chars)",
-                    text.len()
-                );
-                Some(text)
-            }
-            Err(e) => {
-                tracing::warn!("WhatsApp Web: voice transcription failed: {e}");
-                None
-            }
-        }
+        let mime_type = audio
+            .mimetype
+            .as_deref()
+            .map(super::transcription::normalize_audio_mime)
+            .unwrap_or_else(|| "audio/ogg".to_string());
+
+        Some(crate::channels::transcription::PendingVoiceNoteInput::new(
+            crate::providers::traits::TransientAudioInput {
+                mime_type,
+                file_name: file_name.to_string(),
+                bytes: Arc::new(audio_data),
+                duration_secs: audio.seconds.map(u64::from),
+            },
+            runtime.clone(),
+            "[Voice] ".to_string(),
+        ))
     }
 
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
@@ -674,10 +676,10 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 };
 
-                                // Attempt voice note transcription (ptt = push-to-talk = voice note)
-                                let voice_text = if let Some(ref audio) = msg.audio_message {
+                                // Attempt voice-note download (ptt = push-to-talk = voice note)
+                                let voice_note = if let Some(ref audio) = msg.audio_message {
                                     if audio.ptt == Some(true) {
-                                        Self::try_transcribe_voice_note(
+                                        Self::try_prepare_voice_note(
                                             &client,
                                             audio,
                                             transcription_config.as_ref(),
@@ -694,14 +696,20 @@ impl Channel for WhatsAppWebChannel {
                                     None
                                 };
 
-                                // Use transcribed voice text, or fall back to text content.
+                                let message_id = uuid::Uuid::new_v4().to_string();
+
+                                // Use a voice-note placeholder, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
                                 // We store the chat JID (reply_target) since that's what send() receives.
-                                let content = if let Some(ref vt) = voice_text {
+                                let content = if let Some(voice_note) = voice_note {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(chat.clone());
                                     }
-                                    format!("[Voice] {vt}")
+                                    super::transcription::register_pending_voice_note(
+                                        message_id.clone(),
+                                        voice_note,
+                                    );
+                                    "[Voice message]".to_string()
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
@@ -731,7 +739,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
+                                        id: message_id,
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
@@ -981,7 +989,10 @@ impl WhatsAppWebChannel {
         Self { _private: () }
     }
 
-    pub fn with_transcription(self, _config: crate::config::TranscriptionConfig) -> Self {
+    pub fn with_transcription(
+        self,
+        _runtime: crate::channels::transcription::TranscriptionRuntime,
+    ) -> Self {
         self
     }
 
@@ -1235,7 +1246,9 @@ mod tests {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
 
-        let ch = make_channel().with_transcription(tc);
+        let ch = make_channel().with_transcription(
+            crate::channels::transcription::TranscriptionRuntime::from_config(tc),
+        );
         assert!(ch.transcription.is_some());
     }
 
@@ -1243,7 +1256,9 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn with_transcription_ignores_when_disabled() {
         let tc = crate::config::TranscriptionConfig::default(); // enabled = false
-        let ch = make_channel().with_transcription(tc);
+        let ch = make_channel().with_transcription(
+            crate::channels::transcription::TranscriptionRuntime::from_config(tc),
+        );
         assert!(ch.transcription.is_none());
     }
 

@@ -3,12 +3,34 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct TransientAudioInput {
+    pub mime_type: String,
+    pub file_name: String,
+    pub bytes: Arc<Vec<u8>>,
+    pub duration_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for TransientAudioInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransientAudioInput")
+            .field("mime_type", &self.mime_type)
+            .field("file_name", &self.file_name)
+            .field("bytes_len", &self.bytes.len())
+            .field("duration_secs", &self.duration_secs)
+            .finish()
+    }
+}
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip, default)]
+    pub transient_audio: Option<TransientAudioInput>,
 }
 
 impl ChatMessage {
@@ -16,6 +38,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            transient_audio: None,
         }
     }
 
@@ -23,6 +46,7 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            transient_audio: None,
         }
     }
 
@@ -30,6 +54,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            transient_audio: None,
         }
     }
 
@@ -37,7 +62,13 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            transient_audio: None,
         }
+    }
+
+    pub fn with_transient_audio(mut self, transient_audio: TransientAudioInput) -> Self {
+        self.transient_audio = Some(transient_audio);
+        self
     }
 }
 
@@ -239,6 +270,8 @@ pub struct ProviderCapabilities {
     /// Whether the provider supports prompt caching (Anthropic cache_control,
     /// OpenAI automatic prompt caching).
     pub prompt_caching: bool,
+    /// Whether the provider supports inline audio input parts.
+    pub audio_input_inline: bool,
 }
 
 /// Provider-specific tool payload formats.
@@ -394,6 +427,11 @@ pub trait Provider: Send + Sync {
         self.capabilities().vision
     }
 
+    /// Whether provider supports inline audio input.
+    fn supports_audio_input_inline(&self) -> bool {
+        self.capabilities().audio_input_inline
+    }
+
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op; providers with HTTP clients should override.
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -505,6 +543,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: true,
                 prompt_caching: false,
+                audio_input_inline: false,
             }
         }
 
@@ -527,6 +566,7 @@ mod tests {
 
         let user = ChatMessage::user("Hello");
         assert_eq!(user.role, "user");
+        assert!(user.transient_audio.is_none());
 
         let asst = ChatMessage::assistant("Hi there");
         assert_eq!(asst.role, "assistant");
@@ -614,6 +654,7 @@ mod tests {
         let caps = ProviderCapabilities::default();
         assert!(!caps.native_tool_calling);
         assert!(!caps.vision);
+        assert!(!caps.audio_input_inline);
     }
 
     #[test]
@@ -622,16 +663,19 @@ mod tests {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            audio_input_inline: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            audio_input_inline: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
             vision: false,
             prompt_caching: false,
+            audio_input_inline: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -648,6 +692,12 @@ mod tests {
     fn supports_vision_reflects_capabilities_default_mapping() {
         let provider = CapabilityMockProvider;
         assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn supports_audio_input_inline_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(!provider.supports_audio_input_inline());
     }
 
     #[test]

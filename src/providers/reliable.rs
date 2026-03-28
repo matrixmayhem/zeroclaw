@@ -646,6 +646,13 @@ impl Provider for ReliableProvider {
             .any(|(_, provider)| provider.supports_vision())
     }
 
+    fn supports_audio_input_inline(&self) -> bool {
+        self.providers
+            .first()
+            .map(|(_, provider)| provider.supports_audio_input_inline())
+            .unwrap_or(false)
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
